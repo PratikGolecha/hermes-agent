@@ -28,6 +28,87 @@ import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
+import Database from 'better-sqlite3';
+
+// SQLite storage directory
+const DB_DIR = path.join(process.env.HOME || '~', '.hermes', 'whatsapp');
+mkdirSync(DB_DIR, { recursive: true });
+const DB_PATH = path.join(DB_DIR, 'messages.db');
+
+let db = null;
+
+function initDb() {
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT,
+      sender_name TEXT,
+      chat_name TEXT,
+      is_group INTEGER DEFAULT 0,
+      body TEXT,
+      has_media INTEGER DEFAULT 0,
+      media_type TEXT,
+      media_urls TEXT,
+      timestamp INTEGER NOT NULL,
+      stored_at INTEGER DEFAULT (unixepoch())
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+    
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      body,
+      content='messages',
+      content_rowid='rowid'
+    );
+    
+    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    
+    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.rowid, old.body);
+    END;
+    
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.rowid, old.body);
+      INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+  `);
+  
+  console.log('[bridge] SQLite initialized at', DB_PATH);
+}
+
+function storeMessage(event) {
+  if (!db || !event.messageId) return;
+  try {
+    const stmt = db.prepare(`
+      INSERT OR REPLACE INTO messages 
+      (id, chat_id, sender_id, sender_name, chat_name, is_group, body, has_media, media_type, media_urls, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      event.messageId,
+      event.chatId,
+      event.senderId || null,
+      event.senderName || null,
+      event.chatName || null,
+      event.isGroup ? 1 : 0,
+      event.body || null,
+      event.hasMedia ? 1 : 0,
+      event.mediaType || null,
+      JSON.stringify(event.mediaUrls || []),
+      event.timestamp || Math.floor(Date.now() / 1000)
+    );
+  } catch (err) {
+    console.error('[bridge] DB store error:', err.message);
+  }
+}
+
 // Parse CLI args
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -119,6 +200,7 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+initDb();
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -361,6 +443,7 @@ async function startSocket() {
       };
 
       messageQueue.push(event);
+      storeMessage(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
@@ -505,20 +588,400 @@ app.post('/send-media', async (req, res) => {
   }
 });
 
+// ─── Search endpoint ───────────────────────────────────────────────
+app.get('/search', (req, res) => {
+  const { q, chat_id, limit = 50 } = req.query;
+  if (!q || !db) return res.status(400).json({ error: 'q is required' });
+  
+  try {
+    let rows;
+    if (chat_id) {
+      const stmt = db.prepare(`
+        SELECT m.* FROM messages m
+        JOIN messages_fts fts ON m.rowid = fts.rowid
+        WHERE messages_fts MATCH ? AND m.chat_id = ?
+        ORDER BY m.timestamp DESC LIMIT ?
+      `);
+      rows = stmt.all(q, chat_id, parseInt(limit));
+    } else {
+      const stmt = db.prepare(`
+        SELECT m.* FROM messages m
+        JOIN messages_fts fts ON m.rowid = fts.rowid
+        WHERE messages_fts MATCH ?
+        ORDER BY m.timestamp DESC LIMIT ?
+      `);
+      rows = stmt.all(q, parseInt(limit));
+    }
+    
+    const results = rows.map(r => ({
+      messageId: r.id,
+      chatId: r.chat_id,
+      senderId: r.sender_id,
+      senderName: r.sender_name,
+      chatName: r.chat_name,
+      isGroup: !!r.is_group,
+      body: r.body,
+      hasMedia: !!r.has_media,
+      mediaType: r.media_type,
+      mediaUrls: JSON.parse(r.media_urls || '[]'),
+      timestamp: r.timestamp,
+    }));
+    
+    res.json({ results, count: results.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Backfill endpoint ──────────────────────────────────────────────
+app.post('/backfill', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  
+  const { chat_id, limit = 50 } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
+  try {
+    const conversation = await sock.fetchMessagesFromWhatsApp(chat_id, limit);
+    let stored = 0;
+    
+    for (const msg of (conversation || [])) {
+      if (!msg?.key?.id) continue;
+      const chatId = msg.key.remoteJid;
+      if (!chatId) continue;
+      
+      const isGroup = chatId.endsWith('@g.us');
+      const senderId = msg.key.participant || chatId;
+      const senderNumber = senderId.replace(/@.*/, '');
+      const messageContent = getMessageContent(msg);
+      
+      let body = '';
+      let hasMedia = false;
+      let mediaType = '';
+      const mediaUrls = [];
+      
+      if (messageContent.conversation) body = messageContent.conversation;
+      else if (messageContent.extendedTextMessage?.text) body = messageContent.extendedTextMessage.text;
+      else if (messageContent.imageMessage) {
+        body = messageContent.imageMessage.caption || '';
+        hasMedia = true; mediaType = 'image';
+      } else if (messageContent.videoMessage) {
+        body = messageContent.videoMessage.caption || '';
+        hasMedia = true; mediaType = 'video';
+      } else if (messageContent.audioMessage || messageContent.pttMessage) {
+        hasMedia = true; mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
+      } else if (messageContent.documentMessage) {
+        body = messageContent.documentMessage.caption || '';
+        hasMedia = true; mediaType = 'document';
+      }
+      
+      if (hasMedia && !body) body = `[${mediaType} received]`;
+      if (!body && !hasMedia) continue;
+      
+      const event = {
+        messageId: msg.key.id,
+        chatId,
+        senderId,
+        senderName: msg.pushName || senderNumber,
+        chatName: isGroup ? chatId.split('@')[0] : (msg.pushName || senderNumber),
+        isGroup,
+        body,
+        hasMedia,
+        mediaType,
+        mediaUrls,
+        mentionedIds: [],
+        quotedParticipant: '',
+        botIds: [],
+        timestamp: msg.messageTimestamp,
+      };
+      
+      storeMessage(event);
+      stored++;
+    }
+    
+    res.json({ success: true, stored, total: conversation?.length || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Group management endpoints ─────────────────────────────────────
+app.post('/group/create', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { name, participants = [] } = req.body;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  
+  try {
+    const groupJid = await sock.createGroup(name, participants);
+    res.json({ success: true, groupJid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/groups', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const result = Object.entries(groups).map(([jid, meta]) => ({
+      jid,
+      name: meta.subject || jid,
+      description: meta.desc?.toString() || '',
+      size: meta.size,
+      created: meta.creation,
+      owner: meta.owner,
+      restrict: meta.restrict,
+      announce: meta.announce,
+    }));
+    res.json({ groups: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/rename', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, name } = req.body;
+  if (!chat_id || !name) return res.status(400).json({ error: 'chat_id and name are required' });
+  
+  try {
+    await sock.groupUpdateSubject(chat_id, name);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/description', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, description } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
+  try {
+    await sock.groupUpdateDescription(chat_id, description || '');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/participants/add', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, participants } = req.body;
+  if (!chat_id || !participants?.length) {
+    return res.status(400).json({ error: 'chat_id and participants[] are required' });
+  }
+  
+  try {
+    await sock.groupParticipantsUpdate(chat_id, participants, 'add');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/participants/remove', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, participants } = req.body;
+  if (!chat_id || !participants?.length) {
+    return res.status(400).json({ error: 'chat_id and participants[] are required' });
+  }
+  
+  try {
+    await sock.groupParticipantsUpdate(chat_id, participants, 'remove');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/participants/promote', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, participants } = req.body;
+  if (!chat_id || !participants?.length) {
+    return res.status(400).json({ error: 'chat_id and participants[] are required' });
+  }
+  
+  try {
+    await sock.groupParticipantsUpdate(chat_id, participants, 'promote');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/group/invite-link', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id } = req.query;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
+  try {
+    const code = await sock.groupInviteCode(chat_id);
+    res.json({ invite_link: `https://chat.whatsapp.com/${code}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/invite-link/revoke', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
+  try {
+    const code = await sock.groupRevokeInvite(chat_id);
+    res.json({ invite_link: `https://chat.whatsapp.com/${code}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/group/leave', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
+  try {
+    await sock.groupLeave(chat_id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Reaction endpoint ──────────────────────────────────────────────
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, message_id, emoji } = req.body;
+  if (!chat_id || !message_id || !emoji) {
+    return res.status(400).json({ error: 'chat_id, message_id, and emoji are required' });
+  }
+  
+  try {
+    const key = { remoteJid: chat_id, id: message_id, fromMe: false };
+    await sock.sendMessage(chat_id, { react: { text: emoji, key } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Poll endpoint ─────────────────────────────────────────────────
+app.post('/poll', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, question, options, multiple_answers = false } = req.body;
+  if (!chat_id || !question || !options?.length || options.length < 2) {
+    return res.status(400).json({ error: 'chat_id, question, and at least 2 options are required' });
+  }
+  
+  try {
+    const pollMessage = {
+      pollCreationMessage: {
+        name: question,
+        options: options.map(text => ({ optionName: text })),
+        withMyStatus: false,
+        multipleAnswers: !!multiple_answers,
+      }
+    };
+    const sent = await sock.sendMessage(chat_id, pollMessage);
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Sticker endpoint ──────────────────────────────────────────────
+app.post('/sticker', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, file_path } = req.body;
+  if (!chat_id || !file_path) {
+    return res.status(400).json({ error: 'chat_id and file_path are required' });
+  }
+  
+  try {
+    if (!existsSync(file_path)) {
+      return res.status(404).json({ error: `File not found: ${file_path}` });
+    }
+    
+    const buffer = readFileSync(file_path);
+    const ext = file_path.toLowerCase().split('.').pop();
+    
+    let sticker;
+    if (ext === 'webp') {
+      sticker = { sticker: buffer };
+    } else {
+      return res.status(400).json({ error: 'Only .webp files are supported for stickers. Convert image to .webp first.' });
+    }
+    
+    sticker.sticker.mimetype = 'image/webp';
+    const sent = await sock.sendMessage(chat_id, sticker);
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Unsend (delete for everyone) endpoint ─────────────────────────
+app.delete('/message', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, message_id } = req.body;
+  if (!chat_id || !message_id) {
+    return res.status(400).json({ error: 'chat_id and message_id are required' });
+  }
+  
+  try {
+    const key = { remoteJid: chat_id, id: message_id };
+    await sock.sendMessage(chat_id, { delete: key });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Typing indicator
 app.post('/typing', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
-    return res.status(503).json({ error: 'Not connected' });
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
-
-  const { chatId } = req.body;
-  if (!chatId) return res.status(400).json({ error: 'chatId required' });
-
+  const { chat_id, is_typing } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  
   try {
-    await sock.sendPresenceUpdate('composing', chatId);
+    await sock.sendMessage(chat_id, {
+      presence: is_typing !== false ? 'composing' : 'paused'
+    });
     res.json({ success: true });
   } catch (err) {
-    res.json({ success: false });
+    res.status(500).json({ error: err.message });
   }
 });
 
