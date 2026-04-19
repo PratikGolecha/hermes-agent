@@ -122,6 +122,12 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
+// When true: SQLite storage, FTS5 search, group mgmt, polls, reactions, stickers
+const WHATSAPP_ULTIMATE =
+  typeof process !== 'undefined' &&
+  process.env &&
+  ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_ULTIMATE || '').toLowerCase());
+
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
@@ -200,7 +206,9 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
-initDb();
+if (WHATSAPP_ULTIMATE) {
+  initDb();
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -590,8 +598,12 @@ app.post('/send-media', async (req, res) => {
 
 // ─── Search endpoint ───────────────────────────────────────────────
 app.get('/search', (req, res) => {
+  if (!WHATSAPP_ULTIMATE) {
+    return res.status(403).json({ error: 'Search requires WHATSAPP_ULTIMATE=true. Run "hermes setup" to enable.' });
+  }
   const { q, chat_id, limit = 50 } = req.query;
-  if (!q || !db) return res.status(400).json({ error: 'q is required' });
+  if (!q) return res.status(400).json({ error: 'q is required' });
+  if (!db) return res.status(503).json({ error: 'Database not initialized. Is WHATSAPP_ULTIMATE=true?' });
   
   try {
     let rows;
@@ -635,6 +647,9 @@ app.get('/search', (req, res) => {
 
 // ─── Backfill endpoint ──────────────────────────────────────────────
 app.post('/backfill', async (req, res) => {
+  if (!WHATSAPP_ULTIMATE) {
+    return res.status(403).json({ error: 'Backfill requires WHATSAPP_ULTIMATE=true. Run "hermes setup" to enable.' });
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1028,7 +1043,8 @@ if (PAIR_ONLY) {
   startSocket();
 } else {
   app.listen(PORT, '127.0.0.1', () => {
-    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
+    const ultimateTag = WHATSAPP_ULTIMATE ? ' 🌟 Ultimate' : '';
+    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE}${ultimateTag})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
