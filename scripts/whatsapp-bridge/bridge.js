@@ -649,6 +649,8 @@ app.get('/search', (req, res) => {
 });
 
 // ─── Backfill endpoint ──────────────────────────────────────────────
+// Baileys v7 uses fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
+// which requires a starting message. We use the oldest stored message as anchor.
 app.post('/backfill', async (req, res) => {
   if (!WHATSAPP_ULTIMATE) {
     return res.status(403).json({ error: 'Backfill requires WHATSAPP_ULTIMATE=true. Run "hermes setup" to enable.' });
@@ -656,34 +658,50 @@ app.post('/backfill', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
-  
+
   const { chat_id, limit = 50 } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-  
+
+  if (!db) return res.status(503).json({ error: 'SQLite not available' });
+
   try {
-    // Baileys v7: chatFetch takes (jid, { requests })
-    const conversation = await sock.chatFetch(chat_id, {
-      requests: [{ limit: parseInt(limit), type: 'messages' }],
-    });
-    // conversation is a map of jid -> { messages: [] }
-    const messages = conversation?.[chat_id]?.messages || [];
+    // Find oldest stored message for this chat to use as anchor
+    const oldest = db.prepare(
+      'SELECT id, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp ASC LIMIT 1'
+    ).get(chat_id);
+
+    let oldestMsgKey = null;
+    let oldestMsgTimestamp = Math.floor(Date.now() / 1000); // default: now
+
+    if (oldest) {
+      oldestMsgKey = { remoteJid: chat_id, id: oldest.id, fromMe: false };
+      oldestMsgTimestamp = oldest.timestamp;
+    }
+
+    // Baileys v7: fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
+    // Requests older messages from the phone relative to the anchor
+    const fetchedMessages = await sock.fetchMessageHistory(
+      parseInt(limit),
+      oldestMsgKey,
+      oldestMsgTimestamp
+    );
+
     let stored = 0;
-    
-    for (const msg of messages) {
+    for (const msg of fetchedMessages || []) {
       if (!msg?.key?.id) continue;
       const chatId = msg.key.remoteJid;
       if (!chatId) continue;
-      
+
       const isGroup = chatId.endsWith('@g.us');
       const senderId = msg.key.participant || chatId;
       const senderNumber = senderId.replace(/@.*/, '');
       const messageContent = getMessageContent(msg);
-      
+
       let body = '';
       let hasMedia = false;
       let mediaType = '';
       const mediaUrls = [];
-      
+
       if (messageContent.conversation) body = messageContent.conversation;
       else if (messageContent.extendedTextMessage?.text) body = messageContent.extendedTextMessage.text;
       else if (messageContent.imageMessage) {
@@ -698,10 +716,10 @@ app.post('/backfill', async (req, res) => {
         body = messageContent.documentMessage.caption || '';
         hasMedia = true; mediaType = 'document';
       }
-      
+
       if (hasMedia && !body) body = `[${mediaType} received]`;
       if (!body && !hasMedia) continue;
-      
+
       const event = {
         messageId: msg.key.id,
         chatId,
@@ -718,12 +736,12 @@ app.post('/backfill', async (req, res) => {
         botIds: [],
         timestamp: msg.messageTimestamp,
       };
-      
+
       storeMessage(event);
       stored++;
     }
-    
-    res.json({ success: true, stored, total: messages.length });
+
+    res.json({ success: true, stored, total: fetchedMessages?.length || 0, anchor: oldestMsgKey ? 'used oldest stored message as anchor' : 'no anchor (no stored messages)' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -998,8 +1016,10 @@ app.post('/react', async (req, res) => {
   if (!chat_id || !message_id || !emoji) {
     return res.status(400).json({ error: 'chat_id, message_id, and emoji are required' });
   }
-  
+
   try {
+    // Baileys v7: sendMessage with react uses { react: { text, key } }
+    // The key must match the target message
     const key = { remoteJid: chat_id, id: message_id, fromMe: false };
     await sock.sendMessage(chat_id, { react: { text: emoji, key } });
     res.json({ success: true });
@@ -1017,18 +1037,18 @@ app.post('/poll', async (req, res) => {
   if (!chat_id || !question || !options?.length || options.length < 2) {
     return res.status(400).json({ error: 'chat_id, question, and at least 2 options are required' });
   }
-  
+
   try {
-    const pollMessage = {
-      pollCreationMessage: {
+    // Baileys v7: sendMessage with poll uses high-level { poll: { name, values, selectableCount } }
+    // normalizeMessage converts this to the correct proto format
+    await sock.sendMessage(chat_id, {
+      poll: {
         name: question,
-        options: options.map(text => ({ optionName: text })),
-        withMyStatus: false,
-        multipleAnswers: !!multiple_answers,
+        values: options,
+        selectableCount: multiple_answers ? options.length : 1,
       }
-    };
-    const sent = await sock.sendMessage(chat_id, pollMessage);
-    res.json({ success: true, messageId: sent?.key?.id });
+    });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
