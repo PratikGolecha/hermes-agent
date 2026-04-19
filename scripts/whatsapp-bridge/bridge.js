@@ -18,7 +18,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, generateMessageIDV2, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -26,6 +26,7 @@ import path from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
 import Database from 'better-sqlite3';
@@ -206,6 +207,7 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let lastQrData = null; // raw QR string for /qr-image endpoint
 if (WHATSAPP_ULTIMATE) {
   initDb();
 }
@@ -237,6 +239,7 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      lastQrData = qr;
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
@@ -658,10 +661,15 @@ app.post('/backfill', async (req, res) => {
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
   
   try {
-    const conversation = await sock.fetchMessagesFromWhatsApp(chat_id, limit);
+    // Baileys v7: chatFetch takes (jid, { requests })
+    const conversation = await sock.chatFetch(chat_id, {
+      requests: [{ limit: parseInt(limit), type: 'messages' }],
+    });
+    // conversation is a map of jid -> { messages: [] }
+    const messages = conversation?.[chat_id]?.messages || [];
     let stored = 0;
     
-    for (const msg of (conversation || [])) {
+    for (const msg of messages) {
       if (!msg?.key?.id) continue;
       const chatId = msg.key.remoteJid;
       if (!chatId) continue;
@@ -715,23 +723,75 @@ app.post('/backfill', async (req, res) => {
       stored++;
     }
     
-    res.json({ success: true, stored, total: conversation?.length || 0 });
+    res.json({ success: true, stored, total: messages.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─── Group management endpoints ─────────────────────────────────────
+// All group operations use sock.query() directly — Baileys v7 separates
+// group methods into makeGroupsSocket which is NOT part of makeWASocket chain.
+
+// Low-level group IQ query helper
+async function groupQuery(jid, type, content) {
+  return sock.query({
+    tag: 'iq',
+    attrs: { type, xmlns: 'w:g2', to: jid },
+    content,
+  });
+}
+
+// Parse group metadata from WhatsApp binary response
+function parseGroupMetadata(result) {
+  const groupNode = result?.content?.[0];
+  if (!groupNode) return null;
+  const getChild = (tag) => groupNode.content?.find(n => n.tag === tag) || groupNode.attrs?.[tag];
+  const getText = (tag) => {
+    const n = getChild(tag);
+    return n?.content ? Buffer.from(n.content[0]).toString('utf-8') : (n?.attrs?.value || '');
+  };
+  const participants = (groupNode.content || [])
+    .filter(n => n.tag === 'participant')
+    .map(n => ({ id: n.attrs.jid, admin: n.attrs.type === 'admin' ? 'admin' : null }));
+
+  return {
+    id: groupNode.attrs.id ? `${groupNode.attrs.id}@g.us` : jid,
+    subject: groupNode.attrs.subject || getText('subject'),
+    subjectOwner: groupNode.attrs.s_o,
+    subjectTime: Number(groupNode.attrs.s_t || 0),
+    description: getText('description'),
+    size: participants.length,
+    creation: Number(groupNode.attrs.creation || 0),
+    owner: groupNode.attrs.creator ? jidNormalizedUser(groupNode.attrs.creator) : undefined,
+    restrict: !!getChild('locked'),
+    announce: !!getChild('announcement'),
+    participants,
+    ephemeralExpiration: getChild('ephemeral')?.attrs?.expiration,
+  };
+}
+
 app.post('/group/create', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
   const { name, participants = [] } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
-  
+
   try {
-    const groupJid = await sock.createGroup(name, participants);
-    res.json({ success: true, groupJid });
+    const key = generateMessageIDV2();
+    const result = await groupQuery('@g.us', 'set', [
+      {
+        tag: 'create',
+        attrs: { subject: name, key },
+        content: participants.map(jid => ({
+          tag: 'participant',
+          attrs: { jid }
+        }))
+      }
+    ]);
+    const meta = parseGroupMetadata(result);
+    res.json({ success: true, groupJid: meta?.id || result });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -742,18 +802,32 @@ app.get('/groups', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
   try {
-    const groups = await sock.groupFetchAllParticipating();
-    const result = Object.entries(groups).map(([jid, meta]) => ({
+    const result = await sock.query({
+      tag: 'iq',
+      attrs: { to: '@g.us', xmlns: 'w:g2', type: 'get' },
+      content: [{ tag: 'participating', attrs: {}, content: [{ tag: 'participants', attrs: {} }, { tag: 'description', attrs: {} }] }]
+    });
+    const data = {};
+    const groupsChild = result?.content?.find(n => n.tag === 'groups');
+    if (groupsChild) {
+      for (const groupNode of groupsChild.content || []) {
+        if (groupNode.tag === 'group') {
+          const meta = parseGroupMetadata({ content: [groupNode] });
+          if (meta) data[meta.id] = meta;
+        }
+      }
+    }
+    const groupsList = Object.entries(data).map(([jid, meta]) => ({
       jid,
       name: meta.subject || jid,
-      description: meta.desc?.toString() || '',
+      description: meta.description || '',
       size: meta.size,
       created: meta.creation,
       owner: meta.owner,
       restrict: meta.restrict,
       announce: meta.announce,
     }));
-    res.json({ groups: result });
+    res.json({ groups: groupsList });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -765,9 +839,11 @@ app.post('/group/rename', async (req, res) => {
   }
   const { chat_id, name } = req.body;
   if (!chat_id || !name) return res.status(400).json({ error: 'chat_id and name are required' });
-  
+
   try {
-    await sock.groupUpdateSubject(chat_id, name);
+    await groupQuery(chat_id, 'set', [
+      { tag: 'subject', attrs: {}, content: Buffer.from(name, 'utf-8') }
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -780,9 +856,12 @@ app.post('/group/description', async (req, res) => {
   }
   const { chat_id, description } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-  
+
   try {
-    await sock.groupUpdateDescription(chat_id, description || '');
+    const content = description
+      ? [{ tag: 'description', attrs: { id: generateMessageIDV2().slice(0, 12) }, content: [{ tag: 'body', attrs: {}, content: Buffer.from(description, 'utf-8') }] }]
+      : [{ tag: 'description', attrs: { delete: 'true' } }];
+    await groupQuery(chat_id, 'set', content);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -797,9 +876,15 @@ app.post('/group/participants/add', async (req, res) => {
   if (!chat_id || !participants?.length) {
     return res.status(400).json({ error: 'chat_id and participants[] are required' });
   }
-  
+
   try {
-    await sock.groupParticipantsUpdate(chat_id, participants, 'add');
+    await groupQuery(chat_id, 'set', [
+      {
+        tag: 'add',
+        attrs: {},
+        content: participants.map(jid => ({ tag: 'participant', attrs: { jid } }))
+      }
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -814,9 +899,15 @@ app.post('/group/participants/remove', async (req, res) => {
   if (!chat_id || !participants?.length) {
     return res.status(400).json({ error: 'chat_id and participants[] are required' });
   }
-  
+
   try {
-    await sock.groupParticipantsUpdate(chat_id, participants, 'remove');
+    await groupQuery(chat_id, 'set', [
+      {
+        tag: 'remove',
+        attrs: {},
+        content: participants.map(jid => ({ tag: 'participant', attrs: { jid } }))
+      }
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -831,9 +922,15 @@ app.post('/group/participants/promote', async (req, res) => {
   if (!chat_id || !participants?.length) {
     return res.status(400).json({ error: 'chat_id and participants[] are required' });
   }
-  
+
   try {
-    await sock.groupParticipantsUpdate(chat_id, participants, 'promote');
+    await groupQuery(chat_id, 'set', [
+      {
+        tag: 'promote',
+        attrs: {},
+        content: participants.map(jid => ({ tag: 'participant', attrs: { jid } }))
+      }
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -846,9 +943,12 @@ app.get('/group/invite-link', async (req, res) => {
   }
   const { chat_id } = req.query;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-  
+
   try {
-    const code = await sock.groupInviteCode(chat_id);
+    const result = await groupQuery(chat_id, 'get', [{ tag: 'invite', attrs: {} }]);
+    const inviteNode = result?.content?.find(n => n.tag === 'invite');
+    const code = inviteNode?.attrs?.code;
+    if (!code) return res.status(404).json({ error: 'No invite code found' });
     res.json({ invite_link: `https://chat.whatsapp.com/${code}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -861,10 +961,12 @@ app.post('/group/invite-link/revoke', async (req, res) => {
   }
   const { chat_id } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-  
+
   try {
-    const code = await sock.groupRevokeInvite(chat_id);
-    res.json({ invite_link: `https://chat.whatsapp.com/${code}` });
+    const result = await groupQuery(chat_id, 'set', [{ tag: 'revoke', attrs: {}, content: [{ tag: 'invite', attrs: {} }] }]);
+    const inviteNode = result?.content?.find(n => n.tag === 'invite') || result?.content?.[0];
+    const code = inviteNode?.attrs?.code;
+    res.json({ success: true, invite_link: code ? `https://chat.whatsapp.com/${code}` : null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -876,9 +978,11 @@ app.post('/group/leave', async (req, res) => {
   }
   const { chat_id } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-  
+
   try {
-    await sock.groupLeave(chat_id);
+    await groupQuery('@g.us', 'set', [
+      { tag: 'leave', attrs: {}, content: [{ tag: 'group', attrs: { id: chat_id.replace('@g.us', '') } }] }
+    ]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1032,6 +1136,29 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
   });
+});
+
+// QR code as PNG image (for scanning when bridge is run in background)
+app.get('/qr-image', async (req, res) => {
+  if (!lastQrData) {
+    return res.status(404).json({ error: 'No QR code available. Bridge may already be connected or QR expired.' });
+  }
+  try {
+    const png = await QRCode.toBuffer(lastQrData, { type: 'png', width: 400, margin: 2 });
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'no-store');
+    res.send(png);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug: list available socket methods
+app.get('/debug/methods', (req, res) => {
+  if (!sock) return res.status(503).json({ error: 'Not connected' });
+  const proto = Object.getPrototypeOf(sock);
+  const ownMethods = Object.getOwnPropertyNames(proto).filter(m => !m.startsWith('_') && typeof sock[m] === 'function');
+  res.json({ methods: ownMethods.sort() });
 });
 
 // Start
