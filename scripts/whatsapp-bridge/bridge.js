@@ -679,11 +679,22 @@ app.post('/backfill', async (req, res) => {
     }
 
     // Baileys v7: fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
+    // Requires a valid oldestMsgKey — crashes if null is passed.
+    // If no anchor exists, skip backfill and tell user to receive messages first.
+    if (!oldest) {
+      return res.json({
+        success: false,
+        error: 'No anchor message found. Receive some messages first in this chat, then try backfill again.',
+        stored: 0,
+      });
+    }
+
+    // Baileys v7: fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
     // Requests older messages from the phone relative to the anchor
     const fetchedMessages = await sock.fetchMessageHistory(
       parseInt(limit),
-      oldestMsgKey,
-      oldestMsgTimestamp
+      { remoteJid: chat_id, id: oldest.id, fromMe: false },
+      oldest.timestamp
     );
 
     let stored = 0;
@@ -764,24 +775,45 @@ async function groupQuery(jid, type, content) {
 function parseGroupMetadata(result) {
   const groupNode = result?.content?.[0];
   if (!groupNode) return null;
-  const getChild = (tag) => groupNode.content?.find(n => n.tag === tag) || groupNode.attrs?.[tag];
+
+  // content can be an Array, Map, or have numeric keys — normalize to array
+  const contentArr = Array.isArray(groupNode.content)
+    ? groupNode.content
+    : (groupNode.content instanceof Map
+      ? Array.from(groupNode.content.values())
+      : []);
+
+  const getChild = (tag) => {
+    const found = contentArr.find(n => n && n.tag === tag);
+    if (found) return found;
+    // also check attrs (some values stored directly in attrs)
+    return groupNode.attrs?.[tag] ? { attrs: groupNode.attrs, tag } : null;
+  };
   const getText = (tag) => {
     const n = getChild(tag);
-    return n?.content ? Buffer.from(n.content[0]).toString('utf-8') : (n?.attrs?.value || '');
+    if (!n) return '';
+    // content can be Buffer, string, or nested node
+    if (n.content) {
+      const c = Array.isArray(n.content) ? n.content[0] : n.content;
+      if (Buffer.isBuffer(c)) return c.toString('utf-8');
+      if (typeof c === 'string') return c;
+      if (c && typeof c === 'object' && c.toString) return c.toString();
+    }
+    return n.attrs?.value || '';
   };
-  const participants = (groupNode.content || [])
-    .filter(n => n.tag === 'participant')
-    .map(n => ({ id: n.attrs.jid, admin: n.attrs.type === 'admin' ? 'admin' : null }));
+  const participants = contentArr
+    .filter(n => n && n.tag === 'participant')
+    .map(n => ({ id: String(n.attrs?.jid || ''), admin: n.attrs?.type === 'admin' ? 'admin' : null }));
 
   return {
-    id: groupNode.attrs.id ? `${groupNode.attrs.id}@g.us` : jid,
-    subject: groupNode.attrs.subject || getText('subject'),
-    subjectOwner: groupNode.attrs.s_o,
-    subjectTime: Number(groupNode.attrs.s_t || 0),
+    id: groupNode.attrs?.id ? `${groupNode.attrs.id}@g.us` : jid,
+    subject: groupNode.attrs?.subject || getText('subject'),
+    subjectOwner: groupNode.attrs?.s_o,
+    subjectTime: Number(groupNode.attrs?.s_t || 0),
     description: getText('description'),
     size: participants.length,
-    creation: Number(groupNode.attrs.creation || 0),
-    owner: groupNode.attrs.creator ? jidNormalizedUser(groupNode.attrs.creator) : undefined,
+    creation: Number(groupNode.attrs?.creation || 0),
+    owner: groupNode.attrs?.creator ? jidNormalizedUser(groupNode.attrs.creator) : undefined,
     restrict: !!getChild('locked'),
     announce: !!getChild('announcement'),
     participants,
@@ -836,16 +868,20 @@ app.get('/groups', async (req, res) => {
       }
     }
     const groupsList = Object.entries(data).map(([jid, meta]) => ({
-      jid,
-      name: meta.subject || jid,
-      description: meta.description || '',
-      size: meta.size,
-      created: meta.creation,
-      owner: meta.owner,
-      restrict: meta.restrict,
-      announce: meta.announce,
+      jid: String(jid || ''),
+      name: String(meta.subject || jid || ''),
+      description: String(meta.description || ''),
+      size: Number(meta.size || 0),
+      created: Number(meta.creation || 0),
+      owner: meta.owner ? String(meta.owner) : null,
+      restrict: Boolean(meta.restrict),
+      announce: Boolean(meta.announce),
     }));
-    res.json({ groups: groupsList });
+    try {
+      res.json({ groups: groupsList });
+    } catch (e) {
+      res.status(500).json({ error: 'Serialization failed: ' + e.message });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
