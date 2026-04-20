@@ -452,11 +452,11 @@ async function startSocket() {
         mentionedIds,
         quotedParticipant,
         botIds,
-        timestamp: msg.messageTimestamp,
+        timestamp: Number(msg.messageTimestamp),
       };
 
       messageQueue.push(event);
-      storeMessage(event);
+      if (WHATSAPP_ULTIMATE) { storeMessage(event); }
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
@@ -621,11 +621,11 @@ async function startSocket() {
         mentionedIds,
         quotedParticipant,
         botIds,
-        timestamp: msg.messageTimestamp,
+        timestamp: Number(msg.messageTimestamp),
       };
 
       messageQueue.push(event);
-      storeMessage(event);
+      if (WHATSAPP_ULTIMATE) { storeMessage(event); }
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
@@ -904,11 +904,11 @@ app.post('/backfill', async (req, res) => {
         mediaUrls,
         mentionedIds: [],
         quotedParticipant: '',
-        timestamp: msg.messageTimestamp,
+        timestamp: Number(msg.messageTimestamp),
       };
 
       fetchedMessages.push(event);
-      storeMessage(event);
+      if (WHATSAPP_ULTIMATE) { storeMessage(event); }
     }
   };
 
@@ -932,10 +932,20 @@ app.post('/backfill', async (req, res) => {
 
   // Wait up to 30 seconds for messaging-history.set to fire
   // (phone must be active and connected for this to work)
-  const waitMs = 30_000;
-  const start = Date.now();
-  while (!historySetReceived && Date.now() - start < waitMs) {
-    await new Promise(r => setTimeout(r, 500));
+  // Use Promise.race so the Node.js event loop is not blocked
+  try {
+    await Promise.race([
+      new Promise(resolve => {
+        const check = () => {
+          if (historySetReceived) resolve();
+          else setTimeout(check, 500);
+        };
+        check();
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Backfill timed out after 30s')), 30000))
+    ]);
+  } catch (e) {
+    console.log('[bridge] backfill wait:', e.message);
   }
   console.log('[bridge] backfill wait done:', historySetReceived ? 'event received' : 'timeout (phone may be offline)');
 
@@ -946,13 +956,14 @@ app.post('/backfill', async (req, res) => {
   const stored = countAfter - countBefore;
 
   res.json({
-    success: true,
+    success: !fetchError,
     stored,
     total: stored,
     fetched: fetchedMessages.length,
     requestId,
     peerDataRequestSessionId: peerId,
     method: 'messaging-history.set',
+    error: fetchError || undefined,
     note: historySetReceived
       ? 'Phone responded — history delivered via messaging-history.set event.'
       : 'Phone did not respond. Ensure WhatsApp is open and the device is online.',

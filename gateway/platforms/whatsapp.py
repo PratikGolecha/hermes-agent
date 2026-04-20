@@ -798,7 +798,29 @@ class WhatsAppAdapter(BasePlatformAdapter):
             )
         except Exception:
             pass  # Ignore typing indicator failures
-    
+
+    async def request_pairing_code(self, phone_number: str) -> dict:
+        """Request an 8-char WhatsApp pairing code for the given phone number."""
+        if not self._running or not self._http_session:
+            return {"success": False, "error": "Not connected"}
+        bridge_exit = await self._check_managed_bridge_exit()
+        if bridge_exit:
+            return {"success": False, "error": bridge_exit}
+        try:
+            import aiohttp
+            async with self._http_session.post(
+                f"http://127.0.0.1:{self._bridge_port}/pair-code",
+                json={"phoneNumber": phone_number},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    return {"success": True, "pairingCode": data.get("pairingCode"), "phoneNumber": data.get("phoneNumber")}
+                else:
+                    return {"success": False, "error": data.get("error", f"HTTP {resp.status}")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""
         if not self._running or not self._http_session:

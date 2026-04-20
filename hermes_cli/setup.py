@@ -1976,6 +1976,21 @@ def _setup_whatsapp():
             # Clear any stale Ultimate flag
             save_env_value("WHATSAPP_ULTIMATE", "false")
             print_success("WhatsApp enabled (Standard mode)")
+
+        # Ask about pairing preference
+        print()
+        pairing_choices = [
+            "QR Code — scan with WhatsApp app",
+            "Pairing Code — enter phone number to receive an 8-char code",
+        ]
+        pairing_idx = prompt_choice("How would you like to pair?", pairing_choices, 0)
+        if pairing_idx == 1:
+            save_env_value("WHATSAPP_PAIRING_MODE", "code")
+            print_success("Pairing mode: Code")
+        else:
+            save_env_value("WHATSAPP_PAIRING_MODE", "qr")
+            print_success("Pairing mode: QR Code")
+        print_info("Run 'hermes whatsapp' to complete pairing.")
         print_info("Run 'hermes whatsapp' to pair via QR code.")
 
 
