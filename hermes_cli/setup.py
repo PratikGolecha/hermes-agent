@@ -1957,7 +1957,7 @@ def _setup_whatsapp():
     # Ask which mode: Standard vs Ultimate
     mode_desc = [
         "Standard — send/receive only, no local message storage",
-        "Ultimate  — SQLite storage, FTS5 search, group mgmt, polls, reactions",
+        "Ultimate  — SQLite storage, FTS5 search, and on-demand history backfill",
     ]
     mode_idx = prompt_choice(
         "Which WhatsApp mode?",
