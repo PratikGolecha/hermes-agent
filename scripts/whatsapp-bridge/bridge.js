@@ -123,7 +123,9 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
-// When true: SQLite storage, FTS5 search, group mgmt, polls, reactions, stickers
+// When true: SQLite storage with FTS5 search, and on-demand history backfill.
+// Group management, reactions, polls, and stickers are available in BOTH modes
+// (they only need Baileys, not SQLite).
 const WHATSAPP_ULTIMATE =
   typeof process !== 'undefined' &&
   process.env &&
@@ -1425,7 +1427,7 @@ if (PAIR_ONLY) {
   startSocket();
 } else {
   app.listen(PORT, '127.0.0.1', () => {
-    const ultimateTag = WHATSAPP_ULTIMATE ? ' 🌟 Ultimate' : '';
+    const ultimateTag = WHATSAPP_ULTIMATE ? ' 🌟 Ultimate (SQLite + FTS5 + backfill)' : '';
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE}${ultimateTag})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
