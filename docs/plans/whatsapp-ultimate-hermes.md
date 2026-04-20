@@ -130,27 +130,27 @@ Run: SQLite browser — `SELECT COUNT(*) FROM messages` should increase
 
 **File:** `~/.hermes/hermes-agent/scripts/whatsapp-bridge/bridge.js`
 
-**Add new endpoint after `/chat/:id`:**
+**Add new endpoint:**
 ```javascript
 // Search messages (full-text)
 app.get('/search', (req, res) => {
-  const { q, chat, limit = 50 } = req.query;
-  if (!q) return res.status(400).json({ error: 'q (query) required' });
+  const { q, chat_id, limit = 50 } = req.query;
+  if (!q) return res.status(400).json({ error: 'q is required' });
+  if (!db) return res.status(503).json({ error: 'Database not initialized. Is WHATSAPP_ULTIMATE=true?' });
 
   let sql = `
-    SELECT m.*, snippets(messages_fts, 0, '[', ']', '...', 15) as snippet
-    FROM messages_fts f
-    JOIN messages m ON m.id = f.rowid
+    SELECT m.* FROM messages m
+    JOIN messages_fts fts ON m.rowid = fts.rowid
     WHERE messages_fts MATCH ?
   `;
   const params = [q];
 
-  if (chat) {
-    sql += ` AND m.chat_jid = ?`;
-    params.push(chat);
+  if (chat_id) {
+    sql += ` AND m.chat_id = ?`;
+    params.push(chat_id);
   }
 
-  sql += ` ORDER BY rank LIMIT ?`;
+  sql += ` ORDER BY m.timestamp DESC LIMIT ?`;
   params.push(parseInt(limit));
 
   try {
@@ -176,29 +176,31 @@ app.get('/search', (req, res) => {
 ```javascript
 // Trigger history backfill for a specific chat
 app.post('/backfill', async (req, res) => {
+  if (!WHATSAPP_ULTIMATE) {
+    return res.status(403).json({ error: 'Backfill requires WHATSAPP_ULTIMATE=true.' });
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
-  const { chatJid, count = 50 } = req.body;
-  if (!chatJid) return res.status(400).json({ error: 'chatJid required' });
+  const { chat_id, limit = 50 } = req.body;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+  if (!db) return res.status(503).json({ error: 'SQLite not available' });
 
   try {
-    // Baileys sends history sync events automatically on cold start
-    // For on-demand backfill, we request sync from the primary device
-    const result = await sock.requestHistoryForChat(chatJid, count);
-    res.json({ success: true, requested: count });
+    // Find newest stored message to use as anchor
+    const newest = db.prepare(
+      'SELECT id, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 1'
+    ).get(chat_id);
+
+    const result = await sock.fetchMessageHistory(chat_id, limit, newest?.id);
+    res.json({ success: true, requested: limit, anchor: newest?.id || 'none' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 ```
 
-**Note:** If `requestHistoryForChat` doesn't exist in Baileys v7, fall back to:
-```javascript
-// Alternative: just reconnect to trigger full history sync
-await sock柜.reconnect();
-res.json({ success: true, note: 'reconnected to trigger history sync' });
-```
+**Note:** On success, the phone streams history back via `messaging-history.set` events (not `messages.upsert`). A `messaging-history.set` handler must be registered to process these.
 
 ---
 
@@ -282,13 +284,23 @@ app.post('/group/participants/demote', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get invite link
-app.get('/group/invite/:jid', async (req, res) => {
-  if (!sock) return res.status(503).json({ error: 'Not connected' });
+// Get group invite link (GET, not POST — takes chat_id as query param)
+app.get('/group/invite-link', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id } = req.query;
+  if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
+
   try {
-    const code = await sock.groupInviteCode(req.params.jid);
-    res.json({ success: true, code, link: `https://chat.whatsapp.com/${code}` });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const result = await groupQuery(chat_id, 'get', [{ tag: 'invite', attrs: {} }]);
+    const inviteNode = result?.content?.find(n => n.tag === 'invite');
+    const code = inviteNode?.attrs?.code;
+    if (!code) return res.status(404).json({ error: 'No invite code found' });
+    res.json({ invite_link: `https://chat.whatsapp.com/${code}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Revoke invite link
@@ -357,26 +369,22 @@ app.post('/react', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
-  const { chatId, messageId, emoji } = req.body;
-  if (!chatId || !messageId || !emoji) {
-    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
+  const { chat_id, message_id, emoji } = req.body;
+  if (!chat_id || !message_id || !emoji) {
+    return res.status(400).json({ error: 'chat_id, message_id, and emoji are required' });
   }
+
   try {
-    const key = { remoteJid: chatId, id: messageId, fromMe: false };
-    await sock.sendMessage(chatId, { text: emoji }, { quoted: key });
+    const key = { remoteJid: chat_id, id: message_id, fromMe: false };
+    await sock.sendMessage(chat_id, { react: { text: emoji, key } });
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 ```
 
-**Note:** Baileys v7 reactions use `sendMessage` with a reaction payload. If `text: emoji` with `quoted: key` doesn't work, try:
-```javascript
-await sock.sendMessage(chatId, {
-  reactionMessage: { key, text: emoji }
-});
-```
+**Note:** Baileys v7 reactions use `sendMessage` with a reaction payload.
 
 ---
 
@@ -393,21 +401,21 @@ app.post('/poll', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
-  const { chatId, question, options, selectableCount = 1 } = req.body;
-  if (!chatId || !question || !options || options.length < 2) {
-    return res.status(400).json({ error: 'chatId, question, and at least 2 options required' });
+  const { chat_id, question, options, multiple_answers = false } = req.body;
+  if (!chat_id || !question || !options?.length || options.length < 2) {
+    return res.status(400).json({ error: 'chat_id, question, and at least 2 options are required' });
   }
   try {
-    const sent = await sock.sendMessage(chatId, {
+    const sent = await sock.sendMessage(chat_id, {
       poll: {
         name: question,
-        selectableCount: selectableCount,
+        selectableCount: 1,
         values: options,
       }
     });
     res.json({ success: true, messageId: sent?.key?.id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 ```
@@ -431,19 +439,19 @@ app.post('/sticker', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
-  const { chatId, filePath } = req.body;
-  if (!chatId || !filePath) {
-    return res.status(400).json({ error: 'chatId and filePath required' });
+  const { chat_id, file_path } = req.body;
+  if (!chat_id || !file_path) {
+    return res.status(400).json({ error: 'chat_id and file_path are required' });
   }
   try {
-    if (!existsSync(filePath)) {
-      return res.status(404).json({ error: `File not found: ${filePath}` });
+    if (!existsSync(file_path)) {
+      return res.status(404).json({ error: `File not found: ${file_path}` });
     }
-    const buffer = readFileSync(filePath);
-    await sock.sendMessage(chatId, { sticker: buffer, mimetype: 'image/webp' });
+    const buffer = readFileSync(file_path);
+    await sock.sendMessage(chat_id, { sticker: buffer, mimetype: 'image/webp' });
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 ```
@@ -490,10 +498,10 @@ async def search_messages(self, query: str, chat_jid: str = None, limit: int = 5
         async with session.get(f"{self._bridge_url}/search", params=params) as resp:
             return await resp.json()
 
-async def backfill_chat(self, chat_jid: str, count: int = 50) -> Dict[str, Any]:
+async def backfill_chat(self, chat_id: str, limit: int = 50) -> Dict[str, Any]:
     """Request history backfill for a specific chat."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/backfill", json={"chatJid": chat_jid, "count": count}) as resp:
+        async with session.post(f"{self._bridge_url}/backfill", json={"chat_id": chat_id, "limit": limit}) as resp:
             return await resp.json()
 
 async def create_group(self, name: str, participants: List[str]) -> Dict[str, Any]:
@@ -502,54 +510,50 @@ async def create_group(self, name: str, participants: List[str]) -> Dict[str, An
         async with session.post(f"{self._bridge_url}/group/create", json={"name": name, "participants": participants}) as resp:
             return await resp.json()
 
-async def rename_group(self, group_jid: str, name: str) -> Dict[str, Any]:
+async def rename_group(self, chat_id: str, name: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/rename", json={"groupJid": group_jid, "name": name}) as resp:
+        async with session.post(f"{self._bridge_url}/group/rename", json={"chat_id": chat_id, "name": name}) as resp:
             return await resp.json()
 
-async def set_group_description(self, group_jid: str, description: str) -> Dict[str, Any]:
+async def set_group_description(self, chat_id: str, description: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/description", json={"groupJid": group_jid, "description": description}) as resp:
+        async with session.post(f"{self._bridge_url}/group/description", json={"chat_id": chat_id, "description": description}) as resp:
             return await resp.json()
 
-async def add_group_participants(self, group_jid: str, participants: List[str]) -> Dict[str, Any]:
+async def add_group_participants(self, chat_id: str, participants: List[str]) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/participants/add", json={"groupJid": group_jid, "participants": participants}) as resp:
+        async with session.post(f"{self._bridge_url}/group/participants/add", json={"chat_id": chat_id, "participants": participants}) as resp:
             return await resp.json()
 
-async def remove_group_participants(self, group_jid: str, participants: List[str]) -> Dict[str, Any]:
+async def remove_group_participants(self, chat_id: str, participants: List[str]) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/participants/remove", json={"groupJid": group_jid, "participants": participants}) as resp:
+        async with session.post(f"{self._bridge_url}/group/participants/remove", json={"chat_id": chat_id, "participants": participants}) as resp:
             return await resp.json()
 
-async def promote_group_participants(self, group_jid: str, participants: List[str]) -> Dict[str, Any]:
+async def promote_group_participants(self, chat_id: str, participants: List[str]) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/participants/promote", json={"groupJid": group_jid, "participants": participants}) as resp:
+        async with session.post(f"{self._bridge_url}/group/participants/promote", json={"chat_id": chat_id, "participants": participants}) as resp:
             return await resp.json()
 
-async def demote_group_participants(self, group_jid: str, participants: List[str]) -> Dict[str, Any]:
+async def demote_group_participants(self, chat_id: str, participants: List[str]) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/participants/demote", json={"groupJid": group_jid, "participants": participants}) as resp:
+        async with session.post(f"{self._bridge_url}/group/participants/demote", json={"chat_id": chat_id, "participants": participants}) as resp:
             return await resp.json()
 
-async def get_group_invite_link(self, group_jid: str) -> Dict[str, Any]:
+async def get_group_invite_link(self, chat_id: str) -> Dict[str, Any]:
+    """GET /group/invite-link?chat_id= (query param, not path)"""
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"{self._bridge_url}/group/invite/{group_jid}") as resp:
+        async with session.get(f"{self._bridge_url}/group/invite-link", params={"chat_id": chat_id}) as resp:
             return await resp.json()
 
-async def revoke_group_invite_link(self, group_jid: str) -> Dict[str, Any]:
+async def revoke_group_invite_link(self, chat_id: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/invite/revoke", json={"groupJid": group_jid}) as resp:
+        async with session.post(f"{self._bridge_url}/group/invite-link/revoke", json={"chat_id": chat_id}) as resp:
             return await resp.json()
 
-async def leave_group(self, group_jid: str) -> Dict[str, Any]:
+async def leave_group(self, chat_id: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/leave", json={"groupJid": group_jid}) as resp:
-            return await resp.json()
-
-async def get_group_info(self, group_jid: str) -> Dict[str, Any]:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{self._bridge_url}/group/info/{group_jid}") as resp:
+        async with session.post(f"{self._bridge_url}/group/leave", json={"chat_id": chat_id}) as resp:
             return await resp.json()
 
 async def list_groups(self) -> Dict[str, Any]:
@@ -557,29 +561,29 @@ async def list_groups(self) -> Dict[str, Any]:
         async with session.get(f"{self._bridge_url}/groups") as resp:
             return await resp.json()
 
-async def set_group_icon(self, group_jid: str, file_path: str) -> Dict[str, Any]:
+async def set_group_icon(self, chat_id: str, file_path: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/group/icon", json={"groupJid": group_jid, "filePath": file_path}) as resp:
+        async with session.post(f"{self._bridge_url}/group/icon", json={"chat_id": chat_id, "file_path": file_path}) as resp:
             return await resp.json()
 
-async def send_reaction(self, chat_jid: str, message_id: str, emoji: str) -> Dict[str, Any]:
+async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
     """Send a reaction emoji to a specific message."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/react", json={"chatId": chat_jid, "messageId": message_id, "emoji": emoji}) as resp:
+        async with session.post(f"{self._bridge_url}/react", json={"chat_id": chat_id, "message_id": message_id, "emoji": emoji}) as resp:
             return await resp.json()
 
-async def send_poll(self, chat_jid: str, question: str, options: List[str], selectable_count: int = 1) -> Dict[str, Any]:
+async def send_poll(self, chat_id: str, question: str, options: List[str], multiple_answers: bool = False) -> Dict[str, Any]:
     """Send a poll to a chat."""
     async with aiohttp.ClientSession() as session:
         async with session.post(f"{self._bridge_url}/poll", json={
-            "chatId": chat_jid, "question": question, "options": options, "selectableCount": selectable_count
+            "chat_id": chat_id, "question": question, "options": options, "multiple_answers": multiple_answers
         }) as resp:
             return await resp.json()
 
-async def send_sticker(self, chat_jid: str, file_path: str) -> Dict[str, Any]:
+async def send_sticker(self, chat_id: str, file_path: str) -> Dict[str, Any]:
     """Send a WebP sticker to a chat."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{self._bridge_url}/sticker", json={"chatId": chat_jid, "filePath": file_path}) as resp:
+        async with session.post(f"{self._bridge_url}/sticker", json={"chat_id": chat_id, "file_path": file_path}) as resp:
             return await resp.json()
 ```
 

@@ -1944,7 +1944,7 @@ def _setup_whatsapp():
     """Configure WhatsApp bridge."""
     print_header("WhatsApp")
     existing = get_env_value("WHATSAPP_ENABLED")
-    if existing:
+    if existing == "true":
         print_info("WhatsApp: already enabled")
         ultimate_existing = get_env_value("WHATSAPP_ULTIMATE")
         print_info(f"WhatsApp mode: {'Ultimate' if ultimate_existing == 'true' else 'Standard'}")

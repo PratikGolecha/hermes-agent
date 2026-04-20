@@ -137,6 +137,8 @@ const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cac
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 const PAIR_ONLY = args.includes('--pair-only');
+const PAIRING_METHOD = getArg('pairing-method', 'qr'); // "qr" or "code"
+const PAIRING_PHONE = getArg('phone', ''); // phone number for pairing code
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
@@ -240,8 +242,10 @@ async function startSocket() {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    if (qr && PAIRING_METHOD === 'qr') {
       lastQrData = qr;
+      // Log raw QR data to a file so we can fetch it via HTTP even in pair-only mode
+      try { writeFileSync('/tmp/whatsapp_qr.txt', qr); } catch {}
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
@@ -252,7 +256,7 @@ async function startSocket() {
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
-        console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+        console.log('❌ Logged out (test mode - not exiting).'); // process.exit(1);
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
@@ -273,6 +277,30 @@ async function startSocket() {
       }
     }
   });
+
+  // Handle pairing code request (used when PAIRING_METHOD === 'code')
+  if (PAIR_ONLY && PAIRING_METHOD === 'code' && PAIRING_PHONE) {
+    const phone = PAIRING_PHONE.replace(/\D/g, '');
+    if (phone.length >= 10 && phone.length <= 15) {
+      console.log(`\n📱 Requesting pairing code for ${phone}...`);
+      try {
+        const code = await sock.requestPairingCode(phone);
+        console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`   PAIRING CODE: ${code}`);
+        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`\n📋 Enter this code in WhatsApp:`);
+        console.log(`   Settings → Linked Devices → Link a Device`);
+        console.log(`   → "Link with number" instead of scanning QR`);
+        console.log(`\nWaiting for pairing...\n`);
+      } catch (err) {
+        console.error(`❌ Failed to request pairing code: ${err.message}`);
+        process.exit(1);
+      }
+    } else {
+      console.error('❌ Invalid phone number format for pairing code (need 10-15 digits)');
+      process.exit(1);
+    }
+  }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
@@ -1099,6 +1127,40 @@ app.get('/groups', async (req, res) => {
   }
 });
 
+app.get('/group/info/:jid', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const jid = req.params.jid;
+  if (!jid) return res.status(400).json({ error: 'jid is required' });
+
+  try {
+    const result = await sock.query({
+      tag: 'iq',
+      attrs: { to: jid, xmlns: 'w:g2', type: 'get' },
+      content: [{ tag: 'participating', attrs: {}, content: [{ tag: 'participants', attrs: {} }, { tag: 'description', attrs: {} }] }]
+    });
+    const groupNode = result?.content?.[0];
+    if (!groupNode || groupNode.tag !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    const meta = parseGroupMetadata(result);
+    res.json({
+      jid: String(meta.id || jid),
+      name: String(meta.subject || ''),
+      description: String(meta.description || ''),
+      size: Number(meta.size || 0),
+      created: Number(meta.creation || 0),
+      owner: meta.owner ? String(meta.owner) : null,
+      restrict: Boolean(meta.restrict),
+      announce: Boolean(meta.announce),
+      participants: meta.participants || [],
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/group/rename', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
@@ -1203,6 +1265,29 @@ app.post('/group/participants/promote', async (req, res) => {
   }
 });
 
+app.post('/group/participants/demote', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chat_id, participants } = req.body;
+  if (!chat_id || !participants?.length) {
+    return res.status(400).json({ error: 'chat_id and participants[] are required' });
+  }
+
+  try {
+    await groupQuery(chat_id, 'set', [
+      {
+        tag: 'demote',
+        attrs: {},
+        content: participants.map(jid => ({ tag: 'participant', attrs: { jid } }))
+      }
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/group/invite-link', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
@@ -1246,11 +1331,53 @@ app.post('/group/leave', async (req, res) => {
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
 
   try {
-    await groupQuery('@g.us', 'set', [
-      { tag: 'leave', attrs: {}, content: [{ tag: 'group', attrs: { id: chat_id.replace('@g.us', '') } }] }
+    // WhatsApp does NOT send a response to the leave IQ — use Promise.race with a timeout
+    // so we don't hang forever waiting for an acknowledgement that never comes.
+    await Promise.race([
+      groupQuery(chat_id, 'set', [
+        { tag: 'leave', attrs: {}, content: [{ tag: 'group', attrs: { id: chat_id.replace('@g.us', '') } }] }
+      ]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
     ]);
     res.json({ success: true });
   } catch (err) {
+    // Ignore timeout — WhatsApp sends no response on success
+    if (err.message === 'timeout') {
+      return res.json({ success: true });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Group info endpoint ──────────────────────────────────────────
+app.get('/group/info/:jid', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { jid } = req.params;
+  if (!jid) return res.status(400).json({ error: 'jid is required' });
+
+  try {
+    // Use high-level sock.groupMetadata which handles the protocol internally
+    const metadata = await Promise.race([
+      sock.groupMetadata(jid),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
+    ]);
+    res.json({
+      jid: metadata.id || jid,
+      subject: metadata.subject,
+      description: metadata.desc || null,
+      owner: metadata.owner,
+      created: metadata.creation ? parseInt(metadata.creation) : null,
+      restrict: metadata.restrict === true,
+      announce: metadata.announce === true,
+      size: metadata.size || 0,
+      participants: metadata.participants.map(p => ({ jid: p.id, isAdmin: p.isAdmin, isSuperAdmin: p.isSuperAdmin })),
+    });
+  } catch (err) {
+    if (err.message === 'timeout') {
+      return res.status(504).json({ error: 'Group info query timed out' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -1395,6 +1522,27 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// Request pairing code (8-char code instead of QR scan)
+app.post('/pair-code', async (req, res) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'phoneNumber required' });
+  }
+  const phone = phoneNumber.replace(/\D/g, '');
+  if (phone.length < 10 || phone.length > 15) {
+    return res.status(400).json({ error: 'Invalid phone number format' });
+  }
+  if (!sock) {
+    return res.status(503).json({ error: 'Socket not initialized' });
+  }
+  try {
+    const code = await sock.requestPairingCode(phone);
+    res.json({ pairingCode: code, phoneNumber: phone });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Health check
