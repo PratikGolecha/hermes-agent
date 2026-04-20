@@ -460,6 +460,175 @@ async function startSocket() {
       }
     }
   });
+
+  // Permanent handler for backfill / history-sync messages.
+  // fetchMessageHistory() triggers a PDO request; the phone responds via
+  // WebSocket with a HISTORY_SYNC_NOTIFICATION → process-message.ts emits
+  // "messaging-history.set" with { messages, syncType, peerDataRequestSessionId }.
+  // This is a SEPARATE event from messages.upsert and was missing from the bridge.
+  sock.ev.on('messaging-history.set', async ({ messages }) => {
+    if (!messages?.length) return;
+
+    const botIds = Array.from(new Set([
+      normalizeWhatsAppId(sock.user?.id),
+      normalizeWhatsAppId(sock.user?.lid),
+    ].filter(Boolean)));
+
+    for (const msg of messages) {
+      if (!msg?.message) continue;
+
+      const chatId = msg.key.remoteJid;
+      if (WHATSAPP_DEBUG) {
+        try {
+          console.log(JSON.stringify({
+            event: 'history-sync',
+            fromMe: !!msg.key.fromMe,
+            chatId,
+            senderId: msg.key.participant || chatId,
+            messageKeys: Object.keys(msg.message || {}),
+          }));
+        } catch {}
+      }
+
+      const senderId = msg.key.participant || chatId;
+      const isGroup = chatId.endsWith('@g.us');
+      const senderNumber = senderId.replace(/@.*/, '');
+
+      // Skip messages sent BY the bot (fromMe echo-backs)
+      if (msg.key.fromMe) continue;
+
+      // Check allowlist for messages from others (resolve LID ↔ phone aliases)
+      if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        if (WHATSAPP_DEBUG) {
+          try {
+            console.log(JSON.stringify({
+              event: 'history-sync-ignored',
+              reason: 'allowlist_mismatch',
+              chatId,
+              senderId,
+            }));
+          } catch {}
+        }
+        continue;
+      }
+
+      // Extract body and media using the same logic as messages.upsert
+      const messageContent = getMessageContent(msg);
+      const contextInfo = getContextInfo(messageContent);
+      const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
+      const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || contextInfo?.remoteJid || '');
+
+      let body = '';
+      let hasMedia = false;
+      let mediaType = '';
+      const mediaUrls = [];
+
+      if (messageContent.conversation) {
+        body = messageContent.conversation;
+      } else if (messageContent.extendedTextMessage?.text) {
+        body = messageContent.extendedTextMessage.text;
+      } else if (messageContent.imageMessage) {
+        body = messageContent.imageMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'image';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
+          const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+          const ext = extMap[mime] || '.jpg';
+          mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+          const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] history-sync: failed to download image:', err.message);
+        }
+      } else if (messageContent.videoMessage) {
+        body = messageContent.videoMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'video';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const mime = messageContent.videoMessage.mimetype || 'video/mp4';
+          const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
+          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+          const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] history-sync: failed to download video:', err.message);
+        }
+      } else if (messageContent.audioMessage || messageContent.pttMessage) {
+        hasMedia = true;
+        mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
+        try {
+          const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const mime = audioMsg.mimetype || 'audio/ogg';
+          const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+          mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
+          const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] history-sync: failed to download audio:', err.message);
+        }
+      } else if (messageContent.documentMessage) {
+        body = messageContent.documentMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'document';
+        const fileName = messageContent.documentMessage.fileName || 'document';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+          const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+          const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] history-sync: failed to download document:', err.message);
+        }
+      }
+
+      // For media without caption, use a placeholder so the API message is never empty
+      if (hasMedia && !body) {
+        body = `[${mediaType} received]`;
+      }
+
+      // Skip empty messages
+      if (!body && !hasMedia) {
+        if (WHATSAPP_DEBUG) {
+          try {
+            console.log(JSON.stringify({ event: 'history-sync-ignored', reason: 'empty', chatId }));
+          } catch {}
+        }
+        continue;
+      }
+
+      const event = {
+        messageId: msg.key.id,
+        chatId,
+        senderId,
+        senderName: msg.pushName || senderNumber,
+        chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
+        isGroup,
+        body,
+        hasMedia,
+        mediaType,
+        mediaUrls,
+        mentionedIds,
+        quotedParticipant,
+        botIds,
+        timestamp: msg.messageTimestamp,
+      };
+
+      messageQueue.push(event);
+      storeMessage(event);
+      if (messageQueue.length > MAX_QUEUE_SIZE) {
+        messageQueue.shift();
+      }
+    }
+  });
 }
 
 // HTTP server
@@ -649,8 +818,10 @@ app.get('/search', (req, res) => {
 });
 
 // ─── Backfill endpoint ──────────────────────────────────────────────
-// Baileys v7 uses fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
-// which requires a starting message. We use the oldest stored message as anchor.
+// fetchMessageHistory sends a PDO request to the phone and returns a
+// peerDataRequestSessionId string. The phone then streams history back
+// via WebSocket as a 'messaging-history.set' event — NOT messages.upsert.
+// We set up a temporary handler to catch it.
 app.post('/backfill', async (req, res) => {
   if (!WHATSAPP_ULTIMATE) {
     return res.status(403).json({ error: 'Backfill requires WHATSAPP_ULTIMATE=true. Run "hermes setup" to enable.' });
@@ -661,106 +832,134 @@ app.post('/backfill', async (req, res) => {
 
   const { chat_id, limit = 50 } = req.body;
   if (!chat_id) return res.status(400).json({ error: 'chat_id is required' });
-
   if (!db) return res.status(503).json({ error: 'SQLite not available' });
 
-  try {
-    // Find oldest stored message for this chat to use as anchor
-    const oldest = db.prepare(
-      'SELECT id, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp ASC LIMIT 1'
-    ).get(chat_id);
+  // Find newest stored message to use as anchor for fetchMessageHistory
+  const newest = db.prepare(
+    'SELECT id, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 1'
+  ).get(chat_id);
 
-    let oldestMsgKey = null;
-    let oldestMsgTimestamp = Math.floor(Date.now() / 1000); // default: now
+  if (!newest) {
+    return res.json({
+      success: false,
+      error: 'No anchor message. Send/receive a message first to create an anchor, then backfill.',
+      stored: 0,
+    });
+  }
 
-    if (oldest) {
-      oldestMsgKey = { remoteJid: chat_id, id: oldest.id, fromMe: false };
-      oldestMsgTimestamp = oldest.timestamp;
-    }
+  // Count messages BEFORE the fetch
+  const countBefore = db.prepare('SELECT COUNT(*) as c FROM messages WHERE chat_id = ?').get(chat_id)?.c || 0;
+  console.log('[bridge] backfill: countBefore =', countBefore, 'for', chat_id);
 
-    // Baileys v7: fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
-    // Requires a valid oldestMsgKey — crashes if null is passed.
-    // If no anchor exists, skip backfill and tell user to receive messages first.
-    if (!oldest) {
-      return res.json({
-        success: false,
-        error: 'No anchor message found. Receive some messages first in this chat, then try backfill again.',
-        stored: 0,
-      });
-    }
+  // Collect messages from the messaging-history.set event
+  let fetchedMessages = [];
+  let peerId = null;
+  let historySetReceived = false;
 
-    // Baileys v7: fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)
-    // Requests older messages from the phone relative to the anchor
-    const fetchedMessages = await sock.fetchMessageHistory(
-      parseInt(limit),
-      { remoteJid: chat_id, id: oldest.id, fromMe: false },
-      oldest.timestamp
-    );
+  const historyHandler = ({ messages, syncType, peerDataRequestSessionId }) => {
+    console.log('[bridge] messaging-history.set received! syncType:', syncType, 'peerDataRequestSessionId:', peerDataRequestSessionId, 'messages count:', messages?.length);
+    historySetReceived = true;
+    peerId = peerDataRequestSessionId;
 
-    let stored = 0;
-    for (const msg of fetchedMessages || []) {
-      if (!msg?.key?.id) continue;
-      const chatId = msg.key.remoteJid;
-      if (!chatId) continue;
+    // Filter to only messages from the target chat
+    const chatMessages = (messages || []).filter(msg => msg?.key?.remoteJid === chat_id);
+    console.log('[bridge] messaging-history.set: total', messages?.length, 'messages,', chatMessages.length, 'from chat', chat_id);
 
-      const isGroup = chatId.endsWith('@g.us');
-      const senderId = msg.key.participant || chatId;
-      const senderNumber = senderId.replace(/@.*/, '');
-      const messageContent = getMessageContent(msg);
+    for (const msg of chatMessages) {
+      if (!msg?.message) continue;
 
+      // Extract body (same logic as in messages.upsert handler)
       let body = '';
       let hasMedia = false;
       let mediaType = '';
       const mediaUrls = [];
+      const content = msg.message;
 
-      if (messageContent.conversation) body = messageContent.conversation;
-      else if (messageContent.extendedTextMessage?.text) body = messageContent.extendedTextMessage.text;
-      else if (messageContent.imageMessage) {
-        body = messageContent.imageMessage.caption || '';
-        hasMedia = true; mediaType = 'image';
-      } else if (messageContent.videoMessage) {
-        body = messageContent.videoMessage.caption || '';
-        hasMedia = true; mediaType = 'video';
-      } else if (messageContent.audioMessage || messageContent.pttMessage) {
-        hasMedia = true; mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
-      } else if (messageContent.documentMessage) {
-        body = messageContent.documentMessage.caption || '';
-        hasMedia = true; mediaType = 'document';
-      }
+      const conversation = content.conversation || content.extendedTextMessage?.text ||
+        content.imageMessage?.caption || content.videoMessage?.caption ||
+        content.documentMessage?.caption || content.audioMessage?.caption ||
+        (content.listMessage ? '(list)' : '');
 
-      if (hasMedia && !body) body = `[${mediaType} received]`;
+      if (conversation) body = conversation;
+      else if (content.imageMessage) { hasMedia = true; mediaType = 'image'; }
+      else if (content.videoMessage) { hasMedia = true; mediaType = 'video'; }
+      else if (content.audioMessage || content.pttMessage) { hasMedia = true; mediaType = 'ptt'; }
+      else if (content.documentMessage) { hasMedia = true; mediaType = 'document'; }
+
       if (!body && !hasMedia) continue;
 
+      const senderId = msg.key.participant || msg.key.remoteJid;
       const event = {
         messageId: msg.key.id,
-        chatId,
+        chatId: msg.key.remoteJid,
         senderId,
-        senderName: msg.pushName || senderNumber,
-        chatName: isGroup ? chatId.split('@')[0] : (msg.pushName || senderNumber),
-        isGroup,
+        senderName: msg.pushName || senderId.replace(/@.*/, ''),
+        chatName: chat_id.split('@')[0],
+        isGroup: chat_id.endsWith('@g.us'),
         body,
         hasMedia,
         mediaType,
         mediaUrls,
         mentionedIds: [],
         quotedParticipant: '',
-        botIds: [],
         timestamp: msg.messageTimestamp,
       };
 
+      fetchedMessages.push(event);
       storeMessage(event);
-      stored++;
     }
+  };
 
-    res.json({ success: true, stored, total: fetchedMessages?.length || 0, anchor: oldestMsgKey ? 'used oldest stored message as anchor' : 'no anchor (no stored messages)' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  // Attach the handler BEFORE firing fetch so we don't race
+  sock.ev.on('messaging-history.set', historyHandler);
+
+  // Fire the PDO fetch — returns peerDataRequestSessionId string
+  let fetchError = null;
+  let requestId = null;
+  try {
+    requestId = await sock.fetchMessageHistory(
+      parseInt(limit),
+      { remoteJid: chat_id, id: newest.id, fromMe: false },
+      newest.timestamp
+    );
+    console.log('[bridge] fetchMessageHistory returned requestId:', requestId, '(type:', typeof requestId, ')');
+  } catch (e) {
+    console.log('[bridge] fetchMessageHistory error:', e.message);
+    fetchError = e.message;
   }
+
+  // Wait up to 30 seconds for messaging-history.set to fire
+  // (phone must be active and connected for this to work)
+  const waitMs = 30_000;
+  const start = Date.now();
+  while (!historySetReceived && Date.now() - start < waitMs) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+  console.log('[bridge] backfill wait done:', historySetReceived ? 'event received' : 'timeout (phone may be offline)');
+
+  // Always remove handler to prevent memory leaks
+  sock.ev.off('messaging-history.set', historyHandler);
+
+  const countAfter = db.prepare('SELECT COUNT(*) as c FROM messages WHERE chat_id = ?').get(chat_id)?.c || 0;
+  const stored = countAfter - countBefore;
+
+  res.json({
+    success: true,
+    stored,
+    total: stored,
+    fetched: fetchedMessages.length,
+    requestId,
+    peerDataRequestSessionId: peerId,
+    method: 'messaging-history.set',
+    note: historySetReceived
+      ? 'Phone responded — history delivered via messaging-history.set event.'
+      : 'Phone did not respond. Ensure WhatsApp is open and the device is online.',
+  });
 });
 
 // ─── Group management endpoints ─────────────────────────────────────
 // All group operations use sock.query() directly — Baileys v7 separates
-// group methods into makeGroupsSocket which is NOT part of makeWASocket chain.
+// makeGroupsSocket from the main WASocket chain.
 
 // Low-level group IQ query helper
 async function groupQuery(jid, type, content) {
