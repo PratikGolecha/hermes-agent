@@ -1292,28 +1292,65 @@ def cmd_whatsapp(args):
             print("  Start the gateway with: hermes gateway")
             return
 
-    # ── Step 6: QR code pairing ──────────────────────────────────────────
+    # ── Step 6: Pairing method choice ──────────────────────────────────────
     print()
     print("─" * 50)
-    if wa_mode == "bot":
-        print("📱 Open WhatsApp (or WhatsApp Business) on the")
-        print("   phone with the BOT's number, then scan:")
-    else:
-        print("📱 Open WhatsApp on your phone, then scan:")
+    print("How would you like to pair WhatsApp?")
+    print("─" * 50)
     print()
-    print("   Settings → Linked Devices → Link a Device")
+    print("  1. QR code (scan with WhatsApp app)")
+    print("  2. Pairing code (enter number, get 8-digit code)")
+    print()
+    try:
+        pairing_choice = input("  Choose [1/2]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nSetup cancelled.")
+        return
+
+    pairing_method = "qr" if pairing_choice == "1" else "code"
+    pairing_phone = ""
+
+    if pairing_method == "code":
+        print()
+        print("  Enter the phone number for the WhatsApp account")
+        print("  you want to pair (the bot number in bot mode,")
+        print("  or your number in self-chat mode):")
+        print()
+        pairing_phone = input("  Phone number (e.g. 15551234567): ").strip()
+        if not pairing_phone:
+            print("  ⚠ No phone number entered. Falling back to QR code.")
+            pairing_method = "qr"
+            pairing_phone = ""
+
+    # ── Step 7: QR code or pairing code pairing ──────────────────────────────
+    print()
+    print("─" * 50)
+    if pairing_method == "qr":
+        if wa_mode == "bot":
+            print("📱 Open WhatsApp (or WhatsApp Business) on the")
+            print("   phone with the BOT's number, then scan:")
+        else:
+            print("📱 Open WhatsApp on your phone, then scan:")
+        print()
+        print("   Settings → Linked Devices → Link a Device")
+    else:
+        print(f"📱 Pairing code will be requested for {pairing_phone}")
+        print("   You'll enter it in WhatsApp manually.")
+        print()
+        print("   Settings → Linked Devices → Link a Device")
+        print("   → \"Link with number\" instead of scanning QR")
     print("─" * 50)
     print()
 
     try:
-        subprocess.run(
-            ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)],
-            cwd=str(bridge_dir),
-        )
+        cmd = ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)]
+        if pairing_method == "code" and pairing_phone:
+            cmd.extend(["--pairing-method", "code", "--phone", pairing_phone])
+        subprocess.run(cmd, cwd=str(bridge_dir))
     except KeyboardInterrupt:
         pass
 
-    # ── Step 7: Post-pairing ─────────────────────────────────────────────
+    # ── Step 8: Post-pairing ─────────────────────────────────────────────
     print()
     if (session_dir / "creds.json").exists():
         print("✓ WhatsApp paired successfully!")
